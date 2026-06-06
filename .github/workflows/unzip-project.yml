@@ -13,44 +13,101 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Find and unzip project zip
+      - name: Find and unzip Android project
+        shell: bash
         run: |
-          set -e
+          set -Eeuo pipefail
 
-          ZIP_FILE="$(find . -maxdepth 1 -type f -name '*.zip' | head -n 1)"
+          echo "Current directory:"
+          pwd
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "No zip file found in repository root."
+          echo "Repository files before unzip:"
+          find . -maxdepth 4 -type f ! -path './.git/*' -printf '%p (%s bytes)\n' | sort | head -n 200
+
+          echo "Searching for zip files..."
+          mapfile -t ZIP_FILES < <(
+            find . -type f -iname '*.zip' \
+              ! -path './.git/*' \
+              ! -path './_unzipped_project/*' \
+              -printf '%s %p\n' | sort -nr | sed 's/^[0-9]* //'
+          )
+
+          if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+            echo "ERROR: No .zip file found anywhere in the repository."
+            echo "Go to Code tab, repository root, upload the project zip there, then run this workflow again."
             exit 1
           fi
 
-          echo "Found zip: $ZIP_FILE"
+          ZIP_FILE="${ZIP_FILES[0]}"
+          echo "Using zip file: $ZIP_FILE"
 
-          rm -rf _unzipped_project
+          echo "Testing zip integrity..."
+          unzip -t "$ZIP_FILE"
+
+          rm -rf _unzipped_project _inner_zip
           mkdir _unzipped_project
 
+          echo "Extracting main zip..."
           unzip -q "$ZIP_FILE" -d _unzipped_project
 
-          PROJECT_DIR="$(find _unzipped_project -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -printf '%h\n' | head -n 1)"
+          echo "Looking for Gradle project..."
+          PROJECT_DIR="$(
+            find _unzipped_project -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -printf '%h\n' | head -n 1 || true
+          )"
 
           if [ -z "$PROJECT_DIR" ]; then
-            echo "Could not find settings.gradle or settings.gradle.kts inside the zip."
-            echo "Showing extracted files:"
-            find _unzipped_project -maxdepth 4 -type f | head -n 80
+            echo "No Gradle settings file found after first unzip. Searching for inner zip..."
+            INNER_ZIP="$(find _unzipped_project -type f -iname '*.zip' | head -n 1 || true)"
+
+            if [ -n "$INNER_ZIP" ]; then
+              echo "Found inner zip: $INNER_ZIP"
+              mkdir _inner_zip
+              unzip -q "$INNER_ZIP" -d _inner_zip
+
+              PROJECT_DIR="$(
+                find _inner_zip -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -printf '%h\n' | head -n 1 || true
+              )"
+            fi
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: Could not find settings.gradle or settings.gradle.kts inside the zip."
+            echo "Extracted files:"
+            find _unzipped_project -maxdepth 6 -type f | sort | head -n 300
             exit 1
           fi
 
-          echo "Project directory is: $PROJECT_DIR"
+          echo "Project directory found: $PROJECT_DIR"
 
-          shopt -s dotglob
-          cp -R "$PROJECT_DIR"/* ./
+          echo "Copying project files to repository root..."
+          cp -a "$PROJECT_DIR"/. ./
 
-          rm -rf _unzipped_project
+          echo "Cleaning temporary files and uploaded zip..."
+          rm -rf _unzipped_project _inner_zip
           rm -f "$ZIP_FILE"
 
+          echo "Validating result..."
+          if [ ! -f settings.gradle ] && [ ! -f settings.gradle.kts ]; then
+            echo "ERROR: Gradle settings file was not copied to repository root."
+            exit 1
+          fi
+
+          if [ ! -d app ]; then
+            echo "ERROR: app directory was not copied to repository root."
+            exit 1
+          fi
+
+          echo "Repository files after unzip:"
+          find . -maxdepth 3 -type f ! -path './.git/*' -printf '%p\n' | sort | head -n 200
+
       - name: Commit unzipped project
+        shell: bash
         run: |
+          set -Eeuo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
