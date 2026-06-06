@@ -1,6 +1,13 @@
-name: Build APK directly from uploaded zip
+name: Auto Build APK from uploaded zip
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - "*.zip"
+      - "**/*.zip"
+      - ".github/workflows/unzip-project.yml"
   workflow_dispatch:
 
 permissions:
@@ -14,23 +21,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find uploaded project zip
+      - name: Find uploaded Android project zip
         shell: bash
         run: |
           set -Eeuo pipefail
 
           echo "Repository files:"
-          find . -maxdepth 4 -type f ! -path './.git/*' -printf '%p (%s bytes)\n' | sort | head -n 200
+          find . -maxdepth 5 -type f ! -path './.git/*' -printf '%p (%s bytes)\n' | sort | head -n 300
 
           mapfile -t ZIP_FILES < <(
             find . -type f -iname '*.zip' \
               ! -path './.git/*' \
               ! -path './_project/*' \
+              ! -path './_apk_output/*' \
               -printf '%s %p\n' | sort -nr | sed 's/^[0-9]* //'
           )
 
           if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
-            echo "ERROR: No zip file found. Upload the Android project zip to repository root, then run again."
+            echo "ERROR: No zip file found."
+            echo "Upload the Android project zip to the repository, then this workflow will build it automatically."
             exit 1
           fi
 
@@ -46,7 +55,7 @@ jobs:
           rm -rf _project
           mkdir _project
 
-          echo "Testing zip..."
+          echo "Testing zip integrity..."
           unzip -t "$ZIP_FILE"
 
           echo "Extracting zip..."
@@ -57,9 +66,25 @@ jobs:
           )"
 
           if [ -z "$PROJECT_DIR" ]; then
+            echo "No Gradle settings file found after first unzip. Searching for inner zip..."
+            INNER_ZIP="$(find _project -type f -iname '*.zip' | head -n 1 || true)"
+
+            if [ -n "$INNER_ZIP" ]; then
+              echo "Found inner zip: $INNER_ZIP"
+              rm -rf _inner_project
+              mkdir _inner_project
+              unzip -q "$INNER_ZIP" -d _inner_project
+
+              PROJECT_DIR="$(
+                find _inner_project -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -printf '%h\n' | head -n 1 || true
+              )"
+            fi
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
             echo "ERROR: Could not find settings.gradle or settings.gradle.kts inside zip."
             echo "Extracted files:"
-            find _project -maxdepth 6 -type f | sort | head -n 300
+            find _project -maxdepth 8 -type f | sort | head -n 400
             exit 1
           fi
 
@@ -68,7 +93,7 @@ jobs:
 
           if [ ! -d "$PROJECT_DIR/app" ]; then
             echo "ERROR: app directory not found inside project."
-            find "$PROJECT_DIR" -maxdepth 3 -type f | sort | head -n 200
+            find "$PROJECT_DIR" -maxdepth 4 -type f | sort | head -n 300
             exit 1
           fi
 
@@ -77,8 +102,6 @@ jobs:
         run: |
           set -Eeuo pipefail
           cd "$PROJECT_DIR"
-
-          echo "Patching settings.gradle.kts with Android repositories..."
 
           cat > settings.gradle.kts <<'EOF'
           pluginManagement {
@@ -90,7 +113,7 @@ jobs:
           }
 
           dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
               repositories {
                   google()
                   mavenCentral()
@@ -110,12 +133,15 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      - name: Set up Android SDK tools
+        uses: android-actions/setup-android@v3
+
       - name: Set up Gradle 8.2.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.2.1
 
-      - name: Install Android SDK 34 components
+      - name: Install required Android SDK packages
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -123,8 +149,15 @@ jobs:
           echo "ANDROID_HOME=${ANDROID_HOME:-}"
           echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
 
+          echo "sdkmanager location:"
+          which sdkmanager
+
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "build-tools;34.0.0"
 
       - name: Prepare Android local.properties
         shell: bash
@@ -171,7 +204,7 @@ jobs:
           APK_COUNT="$(find _apk_output -type f -name '*.apk' | wc -l)"
           if [ "$APK_COUNT" -eq 0 ]; then
             echo "ERROR: Build finished but no APK was found."
-            find "$PROJECT_DIR/app/build" -maxdepth 6 -type f | sort | head -n 300
+            find "$PROJECT_DIR/app/build" -maxdepth 8 -type f | sort | head -n 500
             exit 1
           fi
 
@@ -199,7 +232,7 @@ jobs:
               -name "problems-report.html" \
             \) -exec cp --parents {} _build_debug_logs/ \; || true
 
-            find "$PROJECT_DIR" -maxdepth 8 -type f | sort > _build_debug_logs/project-file-list.txt || true
+            find "$PROJECT_DIR" -maxdepth 10 -type f | sort > _build_debug_logs/project-file-list.txt || true
           fi
 
       - name: Upload logs if failed
